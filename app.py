@@ -438,7 +438,7 @@ def extract_info():
         }
 
         # Urutkan proxy berdasarkan rasio sukses dan waktu kegagalan terakhir
-        now = time()
+        now = time.time()
         proxies_sorted = sorted(
             PROXIES,
             key=lambda p: (-PROXY_STATUS[p]['success'] / max(PROXY_STATUS[p]['fail'] + 1, 1), 
@@ -454,7 +454,7 @@ def extract_info():
             logger.info(f"Trying proxy {i+1}/{MAX_PROXY_ATTEMPTS}: {proxy}")
             
             try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # Pastikan yt_dlp.YoutubeDL
                     info = ydl.extract_info(url, download=False)
                     if info:
                         PROXY_STATUS[proxy]['success'] += 1
@@ -531,8 +531,8 @@ def download_media():
             subtitle_file = None
             warning = None
 
-            # Urutkan proxy berdasarkan rasio sukses dan waktu kegagalan terakhir
-            now = time()
+            # Urutkan proxy
+            now = time.time()
             proxies_sorted = sorted(
                 PROXIES,
                 key=lambda p: (-PROXY_STATUS[p]['success'] / max(PROXY_STATUS[p]['fail'] + 1, 1), 
@@ -675,7 +675,7 @@ def stream_media():
             }
 
             # Urutkan proxy
-            now = time()
+            now = time.time()
             proxies_sorted = sorted(
                 PROXIES,
                 key=lambda p: (-PROXY_STATUS[p]['success'] / max(PROXY_STATUS[p]['fail'] + 1, 1), 
@@ -777,5 +777,5 @@ def health_check():
     })
 
 if __name__ == '__main__':
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 10000))  # Sesuaikan dengan port Render.com
     app.run(host='0.0.0.0', port=port, threaded=True)
