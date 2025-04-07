@@ -29,11 +29,12 @@ COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.
 os.makedirs(TEMP_DIR, exist_ok=True)
 download_semaphore = threading.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
-# User agents untuk rotasi
+# Enhanced User Agents
 USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:90.0) Gecko/20100101 Firefox/90.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
 ]
 
 class StreamWithCleanup:
@@ -100,10 +101,20 @@ def convert_to_txt(subtitle_file, output_file):
         logger.error(f"Error converting subtitle to txt: {str(e)}")
         return False
 
+def validate_cookies(cookies):
+    """Validate if cookies are in Netscape format"""
+    try:
+        with open(cookies, 'r') as f:
+            first_line = f.readline().strip()
+            return first_line.startswith('# Netscape HTTP Cookie File') or \
+                   any(line.count('\t') >= 6 for line in f)
+    except:
+        return False
+
 def extract_with_cookies(url, user_cookies=None):
-    """Helper function to try user cookies first, then backend cookies.txt, then no cookies"""
+    """Enhanced cookie handling with validation"""
     ydl_opts_base = {
-        'format': 'best',
+        'format': 'bestvideo[height<=1080]+bestaudio/best[height<=1080]',  # Cap at 1080p
         'quiet': True,
         'no_warnings': True,
         'skip_download': True,
@@ -113,11 +124,13 @@ def extract_with_cookies(url, user_cookies=None):
         'nocheckcertificate': True,
         'geo_bypass': True,
         'extractor_retries': 3,
-        'socket_timeout': 10,
+        'socket_timeout': 30,
         'user_agent': random.choice(USER_AGENTS),
+        'http_chunk_size': 10485760,  # 10MB chunks
+        'buffersize': 65536,
     }
 
-    # Step 1: Try with user cookies if provided
+    # Priority 1: Visitor's Cookies
     if user_cookies:
         ydl_opts = ydl_opts_base.copy()
         ydl_opts['http_headers'] = {'Cookie': user_cookies}
@@ -128,24 +141,23 @@ def extract_with_cookies(url, user_cookies=None):
             return info
         except Exception as e:
             logger.warning(f"User cookies failed: {str(e)}")
-            if "Sign in to confirm" in str(e):
-                logger.info("User cookies invalid or missing authentication")
 
-    # Step 2: Fallback to cookies.txt if it exists and not empty
+    # Priority 2: Local cookies.txt with validation
     if os.path.exists(COOKIE_FILE) and os.stat(COOKIE_FILE).st_size > 0:
-        ydl_opts = ydl_opts_base.copy()
-        ydl_opts['cookiefile'] = COOKIE_FILE
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-            logger.info("Success with backend cookies.txt")
-            return info
-        except Exception as e:
-            logger.warning(f"Backend cookies.txt failed: {str(e)}")
-            if "Sign in to confirm" in str(e):
-                logger.info("Backend cookies.txt invalid or expired")
+        if validate_cookies(COOKIE_FILE):
+            ydl_opts = ydl_opts_base.copy()
+            ydl_opts['cookiefile'] = COOKIE_FILE
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                logger.info("Success with validated cookies.txt")
+                return info
+            except Exception as e:
+                logger.warning(f"Valid cookies.txt failed: {str(e)}")
+        else:
+            logger.warning("Invalid cookies.txt format - skipping")
 
-    # Step 3: Try without cookies as last resort
+    # Priority 3: No Cookies
     ydl_opts = ydl_opts_base.copy()
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -153,7 +165,7 @@ def extract_with_cookies(url, user_cookies=None):
         logger.info("Success without cookies")
         return info
     except Exception as e:
-        raise Exception(f"All cookie attempts failed: {str(e)}")
+        raise Exception(f"All fallbacks failed: {str(e)}")
 
 @app.route('/api/extract', methods=['POST'])
 def extract_info():
@@ -182,7 +194,8 @@ def extract_info():
                 'formats': info.get('formats', []),
                 'ffmpeg_available': FFMPEG_AVAILABLE,
                 'has_subtitles': has_subtitles,
-                'subtitle_languages': subtitle_languages
+                'subtitle_languages': subtitle_languages,
+                'filesize_approx': info.get('filesize_approx')
             }
         }
         
@@ -222,22 +235,48 @@ def download_media():
                 'nocheckcertificate': True,
                 'geo_bypass': True,
                 'extractor_retries': 3,
-                'socket_timeout': 10,
+                'socket_timeout': 30,
                 'user_agent': random.choice(USER_AGENTS),
                 'merge_output_format': 'mp4',
+                'http_chunk_size': 10485760,  # 10MB chunks
+                'buffersize': 65536,
+                'throttled_rate': '2M',  # Limit download speed
+                'retries': 10,
+                'fragment_retries': 10,
+                'continuedl': True,
+                'noprogress': True,
             }
+
+            # Apply resolution cap if not specified
+            if not format_id:
+                ydl_opts_base['format'] = 'bestvideo[height<=1080]+bestaudio/best[height<=1080]'
             
             subtitle_file = None
             warning = None
-
             info = None
             last_error = None
             
-            # Step 1: Try with user cookies
-            if user_cookies:
-                ydl_opts = ydl_opts_base.copy()
-                ydl_opts['http_headers'] = {'Cookie': user_cookies}
+            # Enhanced download attempts with proper error handling
+            for attempt in range(3):  # Max 3 attempts
                 try:
+                    # Priority 1: User cookies
+                    if user_cookies and attempt == 0:
+                        ydl_opts = ydl_opts_base.copy()
+                        ydl_opts['http_headers'] = {'Cookie': user_cookies}
+                        logger.info("Attempting download with user cookies")
+                    
+                    # Priority 2: cookies.txt
+                    elif os.path.exists(COOKIE_FILE) and os.stat(COOKIE_FILE).st_size > 0 and validate_cookies(COOKIE_FILE) and attempt <= 1:
+                        ydl_opts = ydl_opts_base.copy()
+                        ydl_opts['cookiefile'] = COOKIE_FILE
+                        logger.info("Attempting download with cookies.txt")
+                    
+                    # Priority 3: No cookies
+                    else:
+                        ydl_opts = ydl_opts_base.copy()
+                        logger.info("Attempting download without cookies")
+                    
+                    # Configure download type
                     if download_type == 'audio' and FFMPEG_AVAILABLE:
                         ydl_opts['format'] = 'bestaudio/best'
                         ydl_opts['postprocessors'] = [{
@@ -247,162 +286,41 @@ def download_media():
                         }]
                         file_extension = 'mp3'
                     else:
-                        ydl_opts['format'] = f"{format_id}+bestaudio/best" if format_id else 'bestvideo+bestaudio/best'
+                        if not format_id:
+                            ydl_opts['format'] = 'bestvideo[height<=1080]+bestaudio/best[height<=1080]'
+                        else:
+                            ydl_opts['format'] = f"{format_id}+bestaudio/best"
                         file_extension = 'mp4'
 
+                    # Handle subtitles
                     if subtitle_option == 1 and subtitle_lang:
-                        temp_ydl_opts = {'skip_download': True, 'http_headers': {'Cookie': user_cookies}}
-                        with yt_dlp.YoutubeDL(temp_ydl_opts) as ydl:
-                            info = ydl.extract_info(url, download=False)
-                            audio_langs = set(fmt.get('language') for fmt in info.get('formats', []) if fmt.get('language') and fmt.get('acodec') != 'none')
-                            if subtitle_lang in audio_langs:
-                                ydl_opts['format'] = f"bestvideo+bestaudio[language={subtitle_lang}]"
-                                if format_id:
-                                    ydl_opts['format'] = f"{format_id}+bestaudio[language={subtitle_lang}]"
-                                ydl_opts['postprocessors'] = [{
-                                    'key': 'FFmpegVideoConvertor',
-                                    'preferedformat': 'mp4'
-                                }]
-                            else:
-                                warning = f"Tidak ada audio dalam bahasa {subtitle_lang}"
-                                ydl_opts['format'] = f"{format_id}+bestaudio/best" if format_id else 'bestvideo+bestaudio/best'
-                                ydl_opts['postprocessors'] = [{
-                                    'key': 'FFmpegVideoConvertor',
-                                    'preferedformat': 'mp4'
-                                }]
-                    
-                    elif subtitle_option == 2 and subtitle_lang:
-                        ydl_opts['writesubtitles'] = True
-                        ydl_opts['subtitleslangs'] = [subtitle_lang]
-                        ydl_opts['subtitlesformat'] = 'vtt'
-                        ydl_opts['format'] = f"{format_id}+bestaudio/best" if format_id else 'bestvideo+bestaudio/best'
+                        ydl_opts['format'] = f"bestvideo+bestaudio[language={subtitle_lang}]/best"
                         ydl_opts['postprocessors'] = [{
                             'key': 'FFmpegVideoConvertor',
                             'preferedformat': 'mp4'
                         }]
-                    
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        info = ydl.extract_info(url, download=True)
-                    logger.info("Download success with user cookies")
-                
-                except Exception as e:
-                    last_error = str(e)
-                    logger.warning(f"User cookies failed for download: {last_error}")
-
-            # Step 2: Fallback to cookies.txt if user cookies fail
-            if not info and os.path.exists(COOKIE_FILE) and os.stat(COOKIE_FILE).st_size > 0:
-                ydl_opts = ydl_opts_base.copy()
-                ydl_opts['cookiefile'] = COOKIE_FILE
-                try:
-                    if download_type == 'audio' and FFMPEG_AVAILABLE:
-                        ydl_opts['format'] = 'bestaudio/best'
-                        ydl_opts['postprocessors'] = [{
-                            'key': 'FFmpegExtractAudio',
-                            'preferredcodec': 'mp3',
-                            'preferredquality': '192',
-                        }]
-                        file_extension = 'mp3'
-                    else:
-                        ydl_opts['format'] = f"{format_id}+bestaudio/best" if format_id else 'bestvideo+bestaudio/best'
-                        file_extension = 'mp4'
-
-                    if subtitle_option == 1 and subtitle_lang:
-                        temp_ydl_opts = {'skip_download': True, 'cookiefile': COOKIE_FILE}
-                        with yt_dlp.YoutubeDL(temp_ydl_opts) as ydl:
-                            info = ydl.extract_info(url, download=False)
-                            audio_langs = set(fmt.get('language') for fmt in info.get('formats', []) if fmt.get('language') and fmt.get('acodec') != 'none')
-                            if subtitle_lang in audio_langs:
-                                ydl_opts['format'] = f"bestvideo+bestaudio[language={subtitle_lang}]"
-                                if format_id:
-                                    ydl_opts['format'] = f"{format_id}+bestaudio[language={subtitle_lang}]"
-                                ydl_opts['postprocessors'] = [{
-                                    'key': 'FFmpegVideoConvertor',
-                                    'preferedformat': 'mp4'
-                                }]
-                            else:
-                                warning = f"Tidak ada audio dalam bahasa {subtitle_lang}"
-                                ydl_opts['format'] = f"{format_id}+bestaudio/best" if format_id else 'bestvideo+bestaudio/best'
-                                ydl_opts['postprocessors'] = [{
-                                    'key': 'FFmpegVideoConvertor',
-                                    'preferedformat': 'mp4'
-                                }]
-                    
                     elif subtitle_option == 2 and subtitle_lang:
                         ydl_opts['writesubtitles'] = True
                         ydl_opts['subtitleslangs'] = [subtitle_lang]
                         ydl_opts['subtitlesformat'] = 'vtt'
-                        ydl_opts['format'] = f"{format_id}+bestaudio/best" if format_id else 'bestvideo+bestaudio/best'
-                        ydl_opts['postprocessors'] = [{
-                            'key': 'FFmpegVideoConvertor',
-                            'preferedformat': 'mp4'
-                        }]
-                    
+
+                    # Execute download
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                         info = ydl.extract_info(url, download=True)
-                    logger.info("Download success with backend cookies.txt")
+                    
+                    logger.info(f"Download successful on attempt {attempt + 1}")
+                    break
                 
                 except Exception as e:
                     last_error = str(e)
-                    logger.warning(f"Backend cookies.txt failed for download: {last_error}")
-
-            # Step 3: Try without cookies if both fail
-            if not info:
-                ydl_opts = ydl_opts_base.copy()
-                try:
-                    if download_type == 'audio' and FFMPEG_AVAILABLE:
-                        ydl_opts['format'] = 'bestaudio/best'
-                        ydl_opts['postprocessors'] = [{
-                            'key': 'FFmpegExtractAudio',
-                            'preferredcodec': 'mp3',
-                            'preferredquality': '192',
-                        }]
-                        file_extension = 'mp3'
-                    else:
-                        ydl_opts['format'] = f"{format_id}+bestaudio/best" if format_id else 'bestvideo+bestaudio/best'
-                        file_extension = 'mp4'
-
-                    if subtitle_option == 1 and subtitle_lang:
-                        temp_ydl_opts = {'skip_download': True}
-                        with yt_dlp.YoutubeDL(temp_ydl_opts) as ydl:
-                            info = ydl.extract_info(url, download=False)
-                            audio_langs = set(fmt.get('language') for fmt in info.get('formats', []) if fmt.get('language') and fmt.get('acodec') != 'none')
-                            if subtitle_lang in audio_langs:
-                                ydl_opts['format'] = f"bestvideo+bestaudio[language={subtitle_lang}]"
-                                if format_id:
-                                    ydl_opts['format'] = f"{format_id}+bestaudio[language={subtitle_lang}]"
-                                ydl_opts['postprocessors'] = [{
-                                    'key': 'FFmpegVideoConvertor',
-                                    'preferedformat': 'mp4'
-                                }]
-                            else:
-                                warning = f"Tidak ada audio dalam bahasa {subtitle_lang}"
-                                ydl_opts['format'] = f"{format_id}+bestaudio/best" if format_id else 'bestvideo+bestaudio/best'
-                                ydl_opts['postprocessors'] = [{
-                                    'key': 'FFmpegVideoConvertor',
-                                    'preferedformat': 'mp4'
-                                }]
-                    
-                    elif subtitle_option == 2 and subtitle_lang:
-                        ydl_opts['writesubtitles'] = True
-                        ydl_opts['subtitleslangs'] = [subtitle_lang]
-                        ydl_opts['subtitlesformat'] = 'vtt'
-                        ydl_opts['format'] = f"{format_id}+bestaudio/best" if format_id else 'bestvideo+bestaudio/best'
-                        ydl_opts['postprocessors'] = [{
-                            'key': 'FFmpegVideoConvertor',
-                            'preferedformat': 'mp4'
-                        }]
-                    
-                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                        info = ydl.extract_info(url, download=True)
-                    logger.info("Download success without cookies")
-                
-                except Exception as e:
-                    last_error = str(e)
-                    logger.warning(f"Download failed without cookies: {last_error}")
+                    logger.warning(f"Attempt {attempt + 1} failed: {last_error}")
+                    time.sleep(2)  # Brief delay between attempts
+                    continue
 
             if not info:
-                return jsonify({'status': 'error', 'message': f"Download failed after all cookie attempts: {last_error or 'Unknown error'}"}), 500
+                return jsonify({'status': 'error', 'message': f"Download failed after all attempts: {last_error or 'Unknown error'}"}), 500
             
+            # Process downloaded files
             file_extension = info.get('ext', file_extension)
             downloaded_files = [f for f in os.listdir(download_dir) if os.path.isfile(os.path.join(download_dir, f))]
             
@@ -411,6 +329,7 @@ def download_media():
             
             media_file = next((f for f in downloaded_files if f.endswith(f'.{file_extension}')), downloaded_files[0])
             
+            # Handle subtitles if requested
             if subtitle_option == 2 and subtitle_lang:
                 subtitle_vtt = next((f for f in downloaded_files if f.endswith(f'.{subtitle_lang}.vtt')), None)
                 if subtitle_vtt:
@@ -421,8 +340,9 @@ def download_media():
                     else:
                         warning = "Failed to convert subtitle to text file"
                 else:
-                    warning = f"Tidak ada subtitle dalam bahasa {subtitle_lang}"
-            
+                    warning = f"No subtitles available in {subtitle_lang}"
+
+            # Apply custom filename if specified
             if custom_name:
                 new_media_file = f"{custom_name}.{file_extension}"
                 os.rename(os.path.join(download_dir, media_file), os.path.join(download_dir, new_media_file))
@@ -437,7 +357,8 @@ def download_media():
                 'download_id': download_id,
                 'filename': media_file,
                 'subtitle_filename': subtitle_file if subtitle_option == 2 else None,
-                'warning': warning
+                'warning': warning,
+                'filesize': os.path.getsize(os.path.join(download_dir, media_file))
             }
             
             return jsonify(response)
