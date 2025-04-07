@@ -23,6 +23,7 @@ CORS(app)
 TEMP_DIR = os.environ.get('TEMP_DIR', os.path.join(os.path.dirname(os.path.abspath(__file__)), 'temp'))
 DOWNLOAD_EXPIRY = int(os.environ.get('DOWNLOAD_EXPIRY', 3600))  # 1 hour
 MAX_CONCURRENT_DOWNLOADS = int(os.environ.get('MAX_CONCURRENT_DOWNLOADS', 3))
+COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.txt')
 
 # Create temp directory if it doesn't exist
 os.makedirs(TEMP_DIR, exist_ok=True)
@@ -42,7 +43,6 @@ PROXIES = [
     'http://170.106.136.235:13001',
     'http://213.32.31.88:80'
 ]
-
 
 MAX_PROXY_ATTEMPTS = 3
 PROXY_STATUS = defaultdict(lambda: {'success': 0, 'fail': 0, 'last_fail': 0})
@@ -112,31 +112,66 @@ def convert_to_txt(subtitle_file, output_file):
         logger.error(f"Error converting subtitle to txt: {str(e)}")
         return False
 
+def extract_with_cookies(url, user_cookies=None, proxy=None):
+    """Helper function to try user cookies first, then fallback to cookies.txt with proxy"""
+    ydl_opts_base = {
+        'format': 'best',
+        'quiet': True,
+        'no_warnings': True,
+        'skip_download': True,
+        'writesubtitles': True,
+        'listsubtitles': True,
+        'ignoreerrors': True,
+        'nocheckcertificate': True,
+        'geo_bypass': True,
+        'extractor_retries': 3,
+        'socket_timeout': 10,
+        'user_agent': random.choice(USER_AGENTS),
+    }
+    if proxy:
+        ydl_opts_base['proxy'] = proxy
+
+    # Step 1: Try with user cookies if provided
+    if user_cookies:
+        ydl_opts = ydl_opts_base.copy()
+        ydl_opts['http_headers'] = {'Cookie': user_cookies}
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            logger.info(f"Success with user cookies (proxy: {proxy or 'none'})")
+            return info
+        except Exception as e:
+            logger.warning(f"User cookies failed (proxy: {proxy or 'none'}): {str(e)}")
+
+    # Step 2: Fallback to cookies.txt if it exists
+    if os.path.exists(COOKIE_FILE):
+        ydl_opts = ydl_opts_base.copy()
+        ydl_opts['cookiefile'] = COOKIE_FILE
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+            logger.info(f"Success with cookies.txt (proxy: {proxy or 'none'})")
+            return info
+        except Exception as e:
+            logger.warning(f"cookies.txt failed (proxy: {proxy or 'none'}): {str(e)}")
+
+    # Step 3: Try without cookies as last resort
+    ydl_opts = ydl_opts_base.copy()
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    logger.info(f"Success without cookies (proxy: {proxy or 'none'})")
+    return info
+
 @app.route('/api/extract', methods=['POST'])
 def extract_info():
     data = request.json
     url = data.get('url')
+    user_cookies = data.get('cookies', '')
     
     if not url:
         return jsonify({'status': 'error', 'message': 'URL is required'}), 400
     
     try:
-        ydl_opts_base = {
-            'format': 'best',
-            'quiet': True,
-            'no_warnings': True,
-            'skip_download': True,
-            'writesubtitles': True,
-            'listsubtitles': True,
-            'ignoreerrors': True,
-            'nocheckcertificate': True,
-            'geo_bypass': True,
-            'extractor_retries': 3,
-            'socket_timeout': 10,
-            'user_agent': random.choice(USER_AGENTS),
-            'cookiefile': os.path.join(os.path.dirname(__file__), 'cookies.txt')
-        }
-
         now = time.time()
         proxies_sorted = sorted(
             PROXIES,
@@ -148,17 +183,13 @@ def extract_info():
         last_error = None
         
         for i, proxy in enumerate(proxies_sorted[:MAX_PROXY_ATTEMPTS]):
-            ydl_opts = ydl_opts_base.copy()
-            ydl_opts['proxy'] = proxy
             logger.info(f"Trying proxy {i+1}/{MAX_PROXY_ATTEMPTS}: {proxy}")
-            
             try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                    if info:
-                        PROXY_STATUS[proxy]['success'] += 1
-                        logger.info(f"Success with proxy: {proxy}")
-                        break
+                info = extract_with_cookies(url, user_cookies, proxy)
+                if info:
+                    PROXY_STATUS[proxy]['success'] += 1
+                    logger.info(f"Success with proxy: {proxy}")
+                    break
             except Exception as e:
                 PROXY_STATUS[proxy]['fail'] += 1
                 PROXY_STATUS[proxy]['last_fail'] = now
@@ -198,6 +229,7 @@ def download_media():
     download_type = data.get('download_type', 'video')
     custom_name = data.get('custom_name', '')
     options = data.get('options', {})
+    user_cookies = data.get('cookies', '')
     
     subtitle_option = options.get('subtitle_option', 0)
     subtitle_lang = options.get('subtitle_lang')
@@ -223,7 +255,6 @@ def download_media():
                 'socket_timeout': 10,
                 'user_agent': random.choice(USER_AGENTS),
                 'merge_output_format': 'mp4',
-                'cookiefile': os.path.join(os.path.dirname(__file__), 'cookies.txt')
             }
             
             subtitle_file = None
@@ -240,9 +271,9 @@ def download_media():
             last_error = None
             
             for i, proxy in enumerate(proxies_sorted[:MAX_PROXY_ATTEMPTS]):
+                logger.info(f"Trying proxy {i+1}/{MAX_PROXY_ATTEMPTS} for download: {proxy}")
                 ydl_opts = ydl_opts_base.copy()
                 ydl_opts['proxy'] = proxy
-                logger.info(f"Trying proxy {i+1}/{MAX_PROXY_ATTEMPTS} for download: {proxy}")
                 
                 try:
                     if download_type == 'audio' and FFMPEG_AVAILABLE:
@@ -257,8 +288,19 @@ def download_media():
                         ydl_opts['format'] = f"{format_id}+bestaudio/best" if format_id else 'bestvideo+bestaudio/best'
                         file_extension = 'mp4'
 
+                    # Apply cookies logic
+                    if user_cookies:
+                        ydl_opts['http_headers'] = {'Cookie': user_cookies}
+                    elif os.path.exists(COOKIE_FILE):
+                        ydl_opts['cookiefile'] = COOKIE_FILE
+
                     if subtitle_option == 1 and subtitle_lang:
-                        with yt_dlp.YoutubeDL({'skip_download': True, 'cookiefile': ydl_opts['cookiefile'], 'proxy': proxy}) as ydl:
+                        temp_ydl_opts = {'skip_download': True, 'proxy': proxy}
+                        if user_cookies:
+                            temp_ydl_opts['http_headers'] = {'Cookie': user_cookies}
+                        elif os.path.exists(COOKIE_FILE):
+                            temp_ydl_opts['cookiefile'] = COOKIE_FILE
+                        with yt_dlp.YoutubeDL(temp_ydl_opts) as ydl:
                             info = ydl.extract_info(url, download=False)
                             audio_langs = set(fmt.get('language') for fmt in info.get('formats', []) if fmt.get('language') and fmt.get('acodec') != 'none')
                             if subtitle_lang in audio_langs:
@@ -351,6 +393,7 @@ def stream_media():
     url = data.get('url')
     format_id = data.get('format_id')
     download_type = data.get('download_type', 'video')
+    user_cookies = data.get('cookies', '')
     
     if not url:
         return jsonify({'status': 'error', 'message': 'URL is required'}), 400
@@ -367,7 +410,6 @@ def stream_media():
                 'extractor_retries': 3,
                 'socket_timeout': 10,
                 'user_agent': random.choice(USER_AGENTS),
-                'cookiefile': os.path.join(os.path.dirname(__file__), 'cookies.txt')
             }
 
             now = time.time()
@@ -401,7 +443,18 @@ def stream_media():
                             content_type = 'video/mp4'
                             extension = 'mp4'
                         
-                        with yt_dlp.YoutubeDL({'quiet': True, 'skip_download': True, 'cookiefile': ydl_opts['cookiefile'], 'proxy': proxy}) as ydl:
+                        # Apply cookies logic
+                        if user_cookies:
+                            ydl_opts['http_headers'] = {'Cookie': user_cookies}
+                        elif os.path.exists(COOKIE_FILE):
+                            ydl_opts['cookiefile'] = COOKIE_FILE
+                        
+                        temp_ydl_opts = {'quiet': True, 'skip_download': True, 'proxy': proxy}
+                        if user_cookies:
+                            temp_ydl_opts['http_headers'] = {'Cookie': user_cookies}
+                        elif os.path.exists(COOKIE_FILE):
+                            temp_ydl_opts['cookiefile'] = COOKIE_FILE
+                        with yt_dlp.YoutubeDL(temp_ydl_opts) as ydl:
                             info = ydl.extract_info(url, download=False)
                             title = info.get('title', 'download').replace('/', '_')
                             filename = f"{title}.{extension}"
@@ -434,6 +487,61 @@ def stream_media():
     except Exception as e:
         logger.error(f"Stream error: {str(e)}")
         return jsonify({'status': 'error', 'message': f'Stream failed: {str(e)}'}), 500
+
+@app.route('/api/batch', methods=['POST'])
+def batch_process():
+    data = request.json
+    urls = data.get('urls', [])
+    user_cookies = data.get('cookies', '')
+    
+    if not urls:
+        return jsonify({'status': 'error', 'message': 'No URLs provided'}), 400
+    
+    results = []
+    count = 0
+    
+    now = time.time()
+    proxies_sorted = sorted(
+        PROXIES,
+        key=lambda p: (-PROXY_STATUS[p]['success'] / max(PROXY_STATUS[p]['fail'] + 1, 1), 
+                      PROXY_STATUS[p]['last_fail'] if PROXY_STATUS[p]['last_fail'] + PROXY_TIMEOUT > now else 0)
+    )
+    
+    for url in urls:
+        info = None
+        last_error = None
+        
+        for i, proxy in enumerate(proxies_sorted[:MAX_PROXY_ATTEMPTS]):
+            try:
+                info = extract_with_cookies(url, user_cookies, proxy)
+                if info:
+                    PROXY_STATUS[proxy]['success'] += 1
+                    count += 1
+                    results.append({
+                        'status': 'ready',
+                        'url': url,
+                        'title': info.get('title', 'Unknown Title'),
+                        'type': 'video' if info.get('formats', []) else 'unknown'
+                    })
+                    break
+            except Exception as e:
+                PROXY_STATUS[proxy]['fail'] += 1
+                PROXY_STATUS[proxy]['last_fail'] = now
+                last_error = str(e)
+                continue
+        
+        if not info:
+            results.append({
+                'status': 'error',
+                'url': url,
+                'error': last_error or 'Failed to extract info'
+            })
+    
+    return jsonify({
+        'status': 'success',
+        'count': count,
+        'results': results
+    })
 
 @app.route('/api/file/<download_id>/<filename>', methods=['GET'])
 def serve_file(download_id, filename):
