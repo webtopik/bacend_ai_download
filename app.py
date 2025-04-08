@@ -34,7 +34,7 @@ COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.
 os.makedirs(TEMP_DIR, exist_ok=True)
 download_semaphore = threading.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
-# User agents untuk rotasi, lebih banyak variasi
+# User agents untuk rotasi
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Safari/605.1.15',
@@ -66,7 +66,6 @@ class StreamWithCleanup:
         return self
     
     def __next__(self):
-        # Buffer: Naik dari 16384 ke 32768 biar file besar lebih stabil
         chunk = self.file.read(32768)
         if not chunk:
             self.file.close()
@@ -121,9 +120,12 @@ def convert_to_txt(subtitle_file, output_file):
         return False
 
 def detect_platform(url):
-    """Deteksi platform berdasarkan URL"""
+    """Deteksi platform berdasarkan URL dengan pengecekan lebih fleksibel"""
+    url = url.lower()
+    if 'youtu.be' in url or 'youtube.com' in url:
+        return 'youtube'
     for platform in SUPPORTED_PLATFORMS:
-        if platform in url.lower():
+        if platform in url:
             return platform
     return None
 
@@ -154,7 +156,6 @@ def fetch_session_cookies(url, session_data):
         else:
             login_url = url
         
-        # Anti-Bot: Delay acak biar ga kaya bot
         time.sleep(random.uniform(1, 3))
         response = session.post(login_url, data=session_data, timeout=15)
         if response.status_code == 200:
@@ -184,13 +185,11 @@ def extract_with_cookies(url, user_cookies=None, session_data=None):
         'ignoreerrors': True,
         'nocheckcertificate': True,
         'geo_bypass': True,
-        # Retry & Timeout: Naik jadi 10 retry sama 20 detik timeout
         'extractor_retries': 10,
         'socket_timeout': 20,
         'user_agent': random.choice(USER_AGENTS),
-        # Anti-Bot: Header tambahan
         'http_headers': {
-            'Referer': 'https://www.google.com/',
+            'Referer': 'https://www.youtube.com/',
             'Accept': '*/*',
             'Accept-Language': 'en-US,en;q=0.5',
         },
@@ -229,8 +228,8 @@ def extract_with_cookies(url, user_cookies=None, session_data=None):
         try:
             with open(COOKIE_FILE, 'r') as f:
                 cookie_content = f.read().strip()
-                if not cookie_content.startswith('#') and '\t' not in cookie_content:
-                    logger.warning("Invalid cookies.txt format - skipping")
+                if not cookie_content.startswith('#') or '\t' not in cookie_content:  # Perbaiki validasi
+                    logger.warning("Invalid cookies.txt format - must be Netscape format with tabs, skipping")
                 else:
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                         info = ydl.extract_info(url, download=False)
@@ -242,14 +241,14 @@ def extract_with_cookies(url, user_cookies=None, session_data=None):
     # Step 3: Tanpa cookie, tambah delay anti-bot
     ydl_opts = ydl_opts_base.copy()
     try:
-        # Anti-Bot: Delay acak
         time.sleep(random.uniform(0.5, 2))
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
         logger.info(f"Success without cookies for {platform}")
         return info
     except Exception as e:
-        raise Exception(f"All cookie attempts failed for {platform}: {str(e)}")
+        logger.error(f"All cookie attempts failed for {platform}: {str(e)}")
+        return None  # Kembalikan None kalau gagal
 
 @app.route('/api/extract', methods=['POST'])
 def extract_info():
@@ -265,7 +264,7 @@ def extract_info():
         info = extract_with_cookies(url, user_cookies, session_data)
         
         if not info:
-            return jsonify({'status': 'error', 'message': 'Failed to extract info'}), 400
+            return jsonify({'status': 'error', 'message': 'Failed to extract info, possibly due to authentication or bot detection'}), 400
         
         has_subtitles = bool(info.get('subtitles'))
         subtitle_languages = list(info.get('subtitles', {}).keys()) if has_subtitles else []
@@ -321,7 +320,6 @@ def download_media():
                 'restrictfilenames': True,
                 'nocheckcertificate': True,
                 'geo_bypass': True,
-                # Retry & Timeout: Naik jadi 10-15 retry sama 20 detik timeout
                 'extractor_retries': 10,
                 'socket_timeout': 20,
                 'user_agent': random.choice(USER_AGENTS),
@@ -329,9 +327,8 @@ def download_media():
                 'fragment_retries': 15,
                 'retries': 15,
                 'fixup': 'force',
-                # Anti-Bot: Header tambahan
                 'http_headers': {
-                    'Referer': 'https://www.google.com/',
+                    'Referer': 'https://www.youtube.com/' if platform == 'youtube' else 'https://www.google.com/',
                     'Accept': '*/*',
                     'Accept-Language': 'en-US,en;q=0.5',
                 },
@@ -342,7 +339,6 @@ def download_media():
             info = None
             last_error = None
             
-            # Status Check: Tambah status file buat sinkronisasi frontend
             status_file = os.path.join(download_dir, 'status.txt')
             with open(status_file, 'w') as f:
                 f.write('downloading')
@@ -387,8 +383,7 @@ def download_media():
                             ydl_opts['format'] = f"{format_id}+bestaudio/best" if format_id else 'bestvideo+bestaudio/best'
                             ydl_opts['postprocessors'] = [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}]
                         
-                        # Anti-Bot: Delay acak
-                        time.sleep(random.uniform(0.5, 2))
+                        time.sleep(random.uniform(0.5, 2))  # Anti-bot delay
                         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                             info = ydl.extract_info(url, download=True)
                         logger.info(f"Download success with session cookies for {platform}")
@@ -449,8 +444,8 @@ def download_media():
                 try:
                     with open(COOKIE_FILE, 'r') as f:
                         cookie_content = f.read().strip()
-                        if not cookie_content.startswith('#') and '\t' not in cookie_content:
-                            logger.warning("Invalid cookies.txt format - skipping")
+                        if not cookie_content.startswith('#') or '\t' not in cookie_content:
+                            logger.warning("Invalid cookies.txt format - must be Netscape format with tabs, skipping")
                         else:
                             if download_type == 'audio' and FFMPEG_AVAILABLE:
                                 ydl_opts['format'] = 'bestaudio/best'
@@ -577,7 +572,6 @@ def download_media():
                     os.rename(os.path.join(download_dir, subtitle_file), os.path.join(download_dir, new_subtitle_file))
                     subtitle_file = new_subtitle_file
             
-            # Status Check: Tandai selesai
             with open(status_file, 'w') as f:
                 f.write('completed')
             
@@ -597,7 +591,6 @@ def download_media():
         logger.error(f"Download error: {str(e)}")
         return jsonify({'status': 'error', 'message': f'Download failed: {str(e)}'}), 500
 
-# Status Check: Endpoint baru buat frontend cek status
 @app.route('/api/status/<download_id>', methods=['GET'])
 def check_status(download_id):
     status_file = os.path.join(TEMP_DIR, download_id, 'status.txt')
@@ -629,13 +622,11 @@ def stream_media():
                 'outtmpl': '-',
                 'nocheckcertificate': True,
                 'geo_bypass': True,
-                # Retry & Timeout: Naik jadi 10-15 retry sama 20 detik timeout
                 'extractor_retries': 10,
                 'socket_timeout': 20,
                 'user_agent': random.choice(USER_AGENTS),
                 'fragment_retries': 15,
                 'retries': 15,
-                # Anti-Bot: Header tambahan
                 'http_headers': {
                     'Referer': 'https://www.google.com/',
                     'Accept': '*/*',
@@ -680,7 +671,6 @@ def stream_media():
                                 stderr=subprocess.PIPE
                             )
                             
-                            # Buffer: Naik jadi 32768
                             for chunk in iter(lambda: process.stdout.read(32768), b''):
                                 yield chunk
                             
