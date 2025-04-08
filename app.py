@@ -29,12 +29,16 @@ TEMP_DIR = os.environ.get('TEMP_DIR', os.path.join(os.path.dirname(os.path.abspa
 DOWNLOAD_EXPIRY = int(os.environ.get('DOWNLOAD_EXPIRY', 3600))  # 1 hour
 MAX_CONCURRENT_DOWNLOADS = int(os.environ.get('MAX_CONCURRENT_DOWNLOADS', 5))
 COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.txt')
+PROXY_LIST = [
+    'http://41.59.90.171:80',  # Tambah proxy sendiri di sini kalau ada
+    'socks5://188.68.52.244:80',
+]  # Opsional: daftar proxy buat bypass bot detection
 
 # Create temp directory if it doesn't exist
 os.makedirs(TEMP_DIR, exist_ok=True)
 download_semaphore = threading.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
-# User agents untuk rotasi
+# User agents untuk rotasi, lebih banyak variasi
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Safari/605.1.15',
@@ -43,6 +47,7 @@ USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:90.0) Gecko/20100101 Firefox/90.0',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.150 Safari/537.36',
     'Mozilla/5.0 (Windows NT 6.1; WOW64; Trident/7.0; rv:11.0) like Gecko',
+    'Mozilla/5.0 (Android 11; Mobile; rv:68.0) Gecko/68.0 Firefox/88.0',
 ]
 
 # Daftar platform yang didukung
@@ -66,7 +71,7 @@ class StreamWithCleanup:
         return self
     
     def __next__(self):
-        chunk = self.file.read(32768)
+        chunk = self.file.read(32768)  # Buffer: 32768 biar stabil
         if not chunk:
             self.file.close()
             self.cleanup()
@@ -120,44 +125,68 @@ def convert_to_txt(subtitle_file, output_file):
         return False
 
 def detect_platform(url):
-    """Deteksi platform berdasarkan URL dengan pengecekan lebih fleksibel"""
+    """Deteksi platform berdasarkan URL dengan pengecekan fleksibel"""
     url = url.lower()
-    if 'youtu.be' in url or 'youtube.com' in url:
+    if 'youtu.be' in url or 'youtube.com' in url or 'youtube' in url:
         return 'youtube'
+    if 'wetv.vip' in url or 'wetv' in url:
+        return 'wetv'
     for platform in SUPPORTED_PLATFORMS:
         if platform in url:
             return platform
     return None
 
 def fetch_session_cookies(url, session_data):
-    """Ambil cookie sesi login dari data sesi pengunjung web dengan delay anti-bot"""
+    """Ambil cookie sesi login dari data sesi pengunjung web dengan anti-bot"""
     session = requests.Session()
     session.headers.update({
         'User-Agent': random.choice(USER_AGENTS),
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.5',
-        'Referer': 'https://www.google.com/',
+        'Referer': 'https://www.youtube.com/' if 'youtube' in url.lower() else 'https://wetv.vip/' if 'wetv' in url.lower() else 'https://www.google.com/',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
     })
+    # Anti-Bot: Proxy opsional
+    if PROXY_LIST:
+        session.proxies = {'http': random.choice(PROXY_LIST), 'https': random.choice(PROXY_LIST)}
+    
     try:
         platform = detect_platform(url)
         if platform == 'youtube':
             login_url = 'https://accounts.google.com/ServiceLogin'
-            session_data = {
-                'Email': session_data.get('username'),
+            payload = {
+                'email': session_data.get('username'),
                 'Passwd': session_data.get('password'),
-                'continue': 'https://www.youtube.com/signin'
+                'continue': 'https://www.youtube.com/signin',
             }
+            # Anti-Bot: Delay lebih variatif
+            time.sleep(random.uniform(2, 5))
+            response = session.get(login_url, timeout=15)
+            if response.status_code != 200:
+                logger.error(f"Failed to reach YouTube login page: {response.status_code}")
+                return None
+            # Simulasi klik login
+            time.sleep(random.uniform(1, 3))
+            response = session.post(login_url, data=payload, timeout=15, allow_redirects=True)
+            if 'youtube.com' not in response.url:
+                logger.error("YouTube login failed, possibly 2FA or CAPTCHA")
+                return None
         elif platform == 'wetv':
             login_url = 'https://wetv.vip/id/account/login'
-            session_data = {
+            payload = {
                 'username': session_data.get('username'),
-                'password': session_data.get('password')
+                'password': session_data.get('password'),
             }
+            time.sleep(random.uniform(2, 5))
+            response = session.post(login_url, data=payload, timeout=15, allow_redirects=True)
+            if 'wetv.vip' not in response.url or 'login' in response.url:
+                logger.error("WeTV login failed, check credentials or CAPTCHA")
+                return None
         else:
-            login_url = url
+            logger.warning(f"No specific login flow for {platform}, skipping session fetch")
+            return None
         
-        time.sleep(random.uniform(1, 3))
-        response = session.post(login_url, data=session_data, timeout=15)
         if response.status_code == 200:
             cookies = session.cookies.get_dict()
             cookie_str = '; '.join([f"{k}={v}" for k, v in cookies.items()])
@@ -171,6 +200,7 @@ def fetch_session_cookies(url, session_data):
         return None
 
 def extract_with_cookies(url, user_cookies=None, session_data=None):
+    """Ekstrak info dengan cookie dan anti-bot canggih"""
     platform = detect_platform(url)
     if not platform:
         logger.warning(f"Platform not detected for URL: {url}")
@@ -189,19 +219,24 @@ def extract_with_cookies(url, user_cookies=None, session_data=None):
         'socket_timeout': 20,
         'user_agent': random.choice(USER_AGENTS),
         'http_headers': {
-            'Referer': 'https://www.youtube.com/',
-            'Accept': '*/*',
+            'Referer': 'https://www.youtube.com/' if platform == 'youtube' else 'https://wetv.vip/' if platform == 'wetv' else 'https://www.google.com/',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.5',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'DNT': '1',  # Do Not Track buat lebih manusiawi
         },
+        'proxy': random.choice(PROXY_LIST) if PROXY_LIST else None,  # Anti-Bot: Proxy opsional
     }
 
-    # Step 0: Gunakan cookie sesi login pengunjung
+    # Step 0: Cookie sesi login pengunjung
     if session_data:
         session_cookies = fetch_session_cookies(url, session_data)
         if session_cookies:
             ydl_opts = ydl_opts_base.copy()
             ydl_opts['http_headers']['Cookie'] = session_cookies
             try:
+                time.sleep(random.uniform(1, 4))  # Anti-Bot: Delay
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=False)
                 logger.info(f"Success with session cookies for {platform}")
@@ -209,11 +244,12 @@ def extract_with_cookies(url, user_cookies=None, session_data=None):
             except Exception as e:
                 logger.warning(f"Session cookies failed for {platform}: {str(e)}")
 
-    # Step 1: Gunakan user cookies
+    # Step 1: Cookie pengguna dari input
     if user_cookies:
         ydl_opts = ydl_opts_base.copy()
         ydl_opts['http_headers']['Cookie'] = user_cookies
         try:
+            time.sleep(random.uniform(1, 4))
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
             logger.info(f"Success with user cookies for {platform}")
@@ -221,16 +257,17 @@ def extract_with_cookies(url, user_cookies=None, session_data=None):
         except Exception as e:
             logger.warning(f"User cookies failed for {platform}: {str(e)}")
 
-    # Step 2: Gunakan cookies.txt dengan validasi
+    # Step 2: Cookie dari cookies.txt
     if os.path.exists(COOKIE_FILE) and os.stat(COOKIE_FILE).st_size > 0:
         ydl_opts = ydl_opts_base.copy()
         ydl_opts['cookiefile'] = COOKIE_FILE
         try:
             with open(COOKIE_FILE, 'r') as f:
                 cookie_content = f.read().strip()
-                if not cookie_content.startswith('#') or '\t' not in cookie_content:  # Perbaiki validasi
+                if not cookie_content.startswith('#') or '\t' not in cookie_content:
                     logger.warning("Invalid cookies.txt format - must be Netscape format with tabs, skipping")
                 else:
+                    time.sleep(random.uniform(1, 4))
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                         info = ydl.extract_info(url, download=False)
                     logger.info(f"Success with backend cookies.txt for {platform}")
@@ -238,17 +275,17 @@ def extract_with_cookies(url, user_cookies=None, session_data=None):
         except Exception as e:
             logger.warning(f"Backend cookies.txt failed for {platform}: {str(e)}")
 
-    # Step 3: Tanpa cookie, tambah delay anti-bot
+    # Step 3: Tanpa cookie, maksimalin anti-bot
     ydl_opts = ydl_opts_base.copy()
     try:
-        time.sleep(random.uniform(0.5, 2))
+        time.sleep(random.uniform(2, 6))  # Anti-Bot: Delay lebih lama
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
         logger.info(f"Success without cookies for {platform}")
         return info
     except Exception as e:
         logger.error(f"All cookie attempts failed for {platform}: {str(e)}")
-        return None  # Kembalikan None kalau gagal
+        return None
 
 @app.route('/api/extract', methods=['POST'])
 def extract_info():
@@ -264,7 +301,7 @@ def extract_info():
         info = extract_with_cookies(url, user_cookies, session_data)
         
         if not info:
-            return jsonify({'status': 'error', 'message': 'Failed to extract info, possibly due to authentication or bot detection'}), 400
+            return jsonify({'status': 'error', 'message': 'Failed to extract info, likely due to authentication or bot detection. Provide valid cookies or session data.'}), 400
         
         has_subtitles = bool(info.get('subtitles'))
         subtitle_languages = list(info.get('subtitles', {}).keys()) if has_subtitles else []
@@ -328,10 +365,14 @@ def download_media():
                 'retries': 15,
                 'fixup': 'force',
                 'http_headers': {
-                    'Referer': 'https://www.youtube.com/' if platform == 'youtube' else 'https://www.google.com/',
-                    'Accept': '*/*',
+                    'Referer': 'https://www.youtube.com/' if platform == 'youtube' else 'https://wetv.vip/' if platform == 'wetv' else 'https://www.google.com/',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
                     'Accept-Language': 'en-US,en;q=0.5',
+                    'Connection': 'keep-alive',
+                    'Upgrade-Insecure-Requests': '1',
+                    'DNT': '1',
                 },
+                'proxy': random.choice(PROXY_LIST) if PROXY_LIST else None,
             }
             
             subtitle_file = None
@@ -383,7 +424,7 @@ def download_media():
                             ydl_opts['format'] = f"{format_id}+bestaudio/best" if format_id else 'bestvideo+bestaudio/best'
                             ydl_opts['postprocessors'] = [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}]
                         
-                        time.sleep(random.uniform(0.5, 2))  # Anti-bot delay
+                        time.sleep(random.uniform(2, 6))
                         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                             info = ydl.extract_info(url, download=True)
                         logger.info(f"Download success with session cookies for {platform}")
@@ -429,7 +470,7 @@ def download_media():
                         ydl_opts['format'] = f"{format_id}+bestaudio/best" if format_id else 'bestvideo+bestaudio/best'
                         ydl_opts['postprocessors'] = [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}]
                     
-                    time.sleep(random.uniform(0.5, 2))
+                    time.sleep(random.uniform(2, 6))
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                         info = ydl.extract_info(url, download=True)
                     logger.info(f"Download success with user cookies for {platform}")
@@ -481,7 +522,7 @@ def download_media():
                                 ydl_opts['format'] = f"{format_id}+bestaudio/best" if format_id else 'bestvideo+bestaudio/best'
                                 ydl_opts['postprocessors'] = [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}]
                             
-                            time.sleep(random.uniform(0.5, 2))
+                            time.sleep(random.uniform(2, 6))
                             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                                 info = ydl.extract_info(url, download=True)
                             logger.info(f"Download success with backend cookies.txt for {platform}")
@@ -527,7 +568,7 @@ def download_media():
                         ydl_opts['format'] = f"{format_id}+bestaudio/best" if format_id else 'bestvideo+bestaudio/best'
                         ydl_opts['postprocessors'] = [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}]
                     
-                    time.sleep(random.uniform(0.5, 2))
+                    time.sleep(random.uniform(2, 6))
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                         info = ydl.extract_info(url, download=True)
                     logger.info(f"Download success without cookies for {platform}")
@@ -628,10 +669,14 @@ def stream_media():
                 'fragment_retries': 15,
                 'retries': 15,
                 'http_headers': {
-                    'Referer': 'https://www.google.com/',
-                    'Accept': '*/*',
+                    'Referer': 'https://www.youtube.com/' if platform == 'youtube' else 'https://wetv.vip/' if platform == 'wetv' else 'https://www.google.com/',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
                     'Accept-Language': 'en-US,en;q=0.5',
+                    'Connection': 'keep-alive',
+                    'Upgrade-Insecure-Requests': '1',
+                    'DNT': '1',
                 },
+                'proxy': random.choice(PROXY_LIST) if PROXY_LIST else None,
             }
 
             def generate():
@@ -664,7 +709,7 @@ def stream_media():
                                 title = info.get('title', 'download').replace('/', '_')
                                 filename = f"{title}.{extension}"
                             
-                            time.sleep(random.uniform(0.5, 2))
+                            time.sleep(random.uniform(2, 6))
                             process = subprocess.Popen(
                                 ['yt-dlp', '-f', ydl_opts['format'], '-o', '-', url, '--http-header', f"Cookie: {session_cookies}"],
                                 stdout=subprocess.PIPE,
@@ -706,7 +751,7 @@ def stream_media():
                             title = info.get('title', 'download').replace('/', '_')
                             filename = f"{title}.{extension}"
                         
-                        time.sleep(random.uniform(0.5, 2))
+                        time.sleep(random.uniform(2, 6))
                         process = subprocess.Popen(
                             ['yt-dlp', '-f', ydl_opts['format'], '-o', '-', url],
                             stdout=subprocess.PIPE,
@@ -730,8 +775,8 @@ def stream_media():
                     try:
                         with open(COOKIE_FILE, 'r') as f:
                             cookie_content = f.read().strip()
-                            if not cookie_content.startswith('#') and '\t' not in cookie_content:
-                                logger.warning("Invalid cookies.txt format - skipping")
+                            if not cookie_content.startswith('#') or '\t' not in cookie_content:
+                                logger.warning("Invalid cookies.txt format - must be Netscape format with tabs, skipping")
                             else:
                                 if download_type == 'audio' and FFMPEG_AVAILABLE:
                                     ydl_opts['format'] = 'bestaudio/best'
@@ -753,7 +798,7 @@ def stream_media():
                                     title = info.get('title', 'download').replace('/', '_')
                                     filename = f"{title}.{extension}"
                                 
-                                time.sleep(random.uniform(0.5, 2))
+                                time.sleep(random.uniform(2, 6))
                                 process = subprocess.Popen(
                                     ['yt-dlp', '-f', ydl_opts['format'], '-o', '-', url],
                                     stdout=subprocess.PIPE,
@@ -793,7 +838,7 @@ def stream_media():
                         title = info.get('title', 'download').replace('/', '_')
                         filename = f"{title}.{extension}"
                     
-                    time.sleep(random.uniform(0.5, 2))
+                    time.sleep(random.uniform(2, 6))
                     process = subprocess.Popen(
                         ['yt-dlp', '-f', ydl_opts['format'], '-o', '-', url],
                         stdout=subprocess.PIPE,
