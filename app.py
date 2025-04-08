@@ -12,7 +12,7 @@ import threading
 import re
 from collections import defaultdict
 try:
-    import requests  # Pastikan requests terinstall
+    import requests
 except ImportError:
     logging.error("Module 'requests' not found. Install it with 'pip install requests'")
     raise
@@ -34,13 +34,15 @@ COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.
 os.makedirs(TEMP_DIR, exist_ok=True)
 download_semaphore = threading.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
-# User agents untuk rotasi
+# User agents untuk rotasi, lebih banyak variasi
 USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Safari/605.1.15',
     'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.107 Safari/537.36',
     'Mozilla/5.0 (iPhone; CPU iPhone OS 14_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:90.0) Gecko/20100101 Firefox/90.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_14_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/88.0.4324.150 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 6.1; WOW64; Trident/7.0; rv:11.0) like Gecko',
 ]
 
 # Daftar platform yang didukung
@@ -64,7 +66,8 @@ class StreamWithCleanup:
         return self
     
     def __next__(self):
-        chunk = self.file.read(16384)
+        # Buffer: Naik dari 16384 ke 32768 biar file besar lebih stabil
+        chunk = self.file.read(32768)
         if not chunk:
             self.file.close()
             self.cleanup()
@@ -125,22 +128,40 @@ def detect_platform(url):
     return None
 
 def fetch_session_cookies(url, session_data):
-    """Ambil cookie sesi login dari data sesi pengunjung web"""
+    """Ambil cookie sesi login dari data sesi pengunjung web dengan delay anti-bot"""
     session = requests.Session()
-    session.headers.update({'User-Agent': random.choice(USER_AGENTS)})
+    session.headers.update({
+        'User-Agent': random.choice(USER_AGENTS),
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+        'Referer': 'https://www.google.com/',
+    })
     try:
         platform = detect_platform(url)
         if platform == 'youtube':
             login_url = 'https://accounts.google.com/ServiceLogin'
+            session_data = {
+                'Email': session_data.get('username'),
+                'Passwd': session_data.get('password'),
+                'continue': 'https://www.youtube.com/signin'
+            }
         elif platform == 'wetv':
-            login_url = 'https://wetv.vip/id/account/login'  # Ganti dengan URL login WeTV yang benar
+            login_url = 'https://wetv.vip/id/account/login'
+            session_data = {
+                'username': session_data.get('username'),
+                'password': session_data.get('password')
+            }
         else:
-            login_url = url  # Default ke URL yang diberikan
+            login_url = url
         
-        response = session.post(login_url, data=session_data, timeout=10)
+        # Anti-Bot: Delay acak biar ga kaya bot
+        time.sleep(random.uniform(1, 3))
+        response = session.post(login_url, data=session_data, timeout=15)
         if response.status_code == 200:
             cookies = session.cookies.get_dict()
-            return '; '.join([f"{k}={v}" for k, v in cookies.items()])
+            cookie_str = '; '.join([f"{k}={v}" for k, v in cookies.items()])
+            logger.info(f"Session cookies fetched for {platform}: {cookie_str}")
+            return cookie_str
         else:
             logger.error(f"Failed to fetch session cookies: {response.status_code}")
             return None
@@ -163,9 +184,16 @@ def extract_with_cookies(url, user_cookies=None, session_data=None):
         'ignoreerrors': True,
         'nocheckcertificate': True,
         'geo_bypass': True,
-        'extractor_retries': 5,
-        'socket_timeout': 15,
+        # Retry & Timeout: Naik jadi 10 retry sama 20 detik timeout
+        'extractor_retries': 10,
+        'socket_timeout': 20,
         'user_agent': random.choice(USER_AGENTS),
+        # Anti-Bot: Header tambahan
+        'http_headers': {
+            'Referer': 'https://www.google.com/',
+            'Accept': '*/*',
+            'Accept-Language': 'en-US,en;q=0.5',
+        },
     }
 
     # Step 0: Gunakan cookie sesi login pengunjung
@@ -173,7 +201,7 @@ def extract_with_cookies(url, user_cookies=None, session_data=None):
         session_cookies = fetch_session_cookies(url, session_data)
         if session_cookies:
             ydl_opts = ydl_opts_base.copy()
-            ydl_opts['http_headers'] = {'Cookie': session_cookies}
+            ydl_opts['http_headers']['Cookie'] = session_cookies
             try:
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(url, download=False)
@@ -185,7 +213,7 @@ def extract_with_cookies(url, user_cookies=None, session_data=None):
     # Step 1: Gunakan user cookies
     if user_cookies:
         ydl_opts = ydl_opts_base.copy()
-        ydl_opts['http_headers'] = {'Cookie': user_cookies}
+        ydl_opts['http_headers']['Cookie'] = user_cookies
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -194,7 +222,7 @@ def extract_with_cookies(url, user_cookies=None, session_data=None):
         except Exception as e:
             logger.warning(f"User cookies failed for {platform}: {str(e)}")
 
-    # Step 2: Gunakan cookies.txt dengan validasi format
+    # Step 2: Gunakan cookies.txt dengan validasi
     if os.path.exists(COOKIE_FILE) and os.stat(COOKIE_FILE).st_size > 0:
         ydl_opts = ydl_opts_base.copy()
         ydl_opts['cookiefile'] = COOKIE_FILE
@@ -211,9 +239,11 @@ def extract_with_cookies(url, user_cookies=None, session_data=None):
         except Exception as e:
             logger.warning(f"Backend cookies.txt failed for {platform}: {str(e)}")
 
-    # Step 3: Tanpa cookie
+    # Step 3: Tanpa cookie, tambah delay anti-bot
     ydl_opts = ydl_opts_base.copy()
     try:
+        # Anti-Bot: Delay acak
+        time.sleep(random.uniform(0.5, 2))
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
         logger.info(f"Success without cookies for {platform}")
@@ -291,13 +321,20 @@ def download_media():
                 'restrictfilenames': True,
                 'nocheckcertificate': True,
                 'geo_bypass': True,
-                'extractor_retries': 5,
-                'socket_timeout': 15,
+                # Retry & Timeout: Naik jadi 10-15 retry sama 20 detik timeout
+                'extractor_retries': 10,
+                'socket_timeout': 20,
                 'user_agent': random.choice(USER_AGENTS),
                 'merge_output_format': 'mp4',
-                'fragment_retries': 10,
-                'retries': 10,
+                'fragment_retries': 15,
+                'retries': 15,
                 'fixup': 'force',
+                # Anti-Bot: Header tambahan
+                'http_headers': {
+                    'Referer': 'https://www.google.com/',
+                    'Accept': '*/*',
+                    'Accept-Language': 'en-US,en;q=0.5',
+                },
             }
             
             subtitle_file = None
@@ -305,11 +342,16 @@ def download_media():
             info = None
             last_error = None
             
+            # Status Check: Tambah status file buat sinkronisasi frontend
+            status_file = os.path.join(download_dir, 'status.txt')
+            with open(status_file, 'w') as f:
+                f.write('downloading')
+
             if session_data:
                 session_cookies = fetch_session_cookies(url, session_data)
                 if session_cookies:
                     ydl_opts = ydl_opts_base.copy()
-                    ydl_opts['http_headers'] = {'Cookie': session_cookies}
+                    ydl_opts['http_headers']['Cookie'] = session_cookies
                     try:
                         if download_type == 'audio' and FFMPEG_AVAILABLE:
                             ydl_opts['format'] = 'bestaudio/best'
@@ -324,7 +366,7 @@ def download_media():
                             file_extension = 'mp4'
 
                         if subtitle_option == 1 and subtitle_lang:
-                            temp_ydl_opts = {'skip_download': True, 'http_headers': {'Cookie': session_cookies}}
+                            temp_ydl_opts = {'skip_download': True, 'http_headers': ydl_opts['http_headers']}
                             with yt_dlp.YoutubeDL(temp_ydl_opts) as ydl:
                                 info = ydl.extract_info(url, download=False)
                                 audio_langs = set(fmt.get('language') for fmt in info.get('formats', []) if fmt.get('language') and fmt.get('acodec') != 'none')
@@ -345,6 +387,8 @@ def download_media():
                             ydl_opts['format'] = f"{format_id}+bestaudio/best" if format_id else 'bestvideo+bestaudio/best'
                             ydl_opts['postprocessors'] = [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}]
                         
+                        # Anti-Bot: Delay acak
+                        time.sleep(random.uniform(0.5, 2))
                         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                             info = ydl.extract_info(url, download=True)
                         logger.info(f"Download success with session cookies for {platform}")
@@ -354,7 +398,7 @@ def download_media():
 
             if not info and user_cookies:
                 ydl_opts = ydl_opts_base.copy()
-                ydl_opts['http_headers'] = {'Cookie': user_cookies}
+                ydl_opts['http_headers']['Cookie'] = user_cookies
                 try:
                     if download_type == 'audio' and FFMPEG_AVAILABLE:
                         ydl_opts['format'] = 'bestaudio/best'
@@ -369,7 +413,7 @@ def download_media():
                         file_extension = 'mp4'
 
                     if subtitle_option == 1 and subtitle_lang:
-                        temp_ydl_opts = {'skip_download': True, 'http_headers': {'Cookie': user_cookies}}
+                        temp_ydl_opts = {'skip_download': True, 'http_headers': ydl_opts['http_headers']}
                         with yt_dlp.YoutubeDL(temp_ydl_opts) as ydl:
                             info = ydl.extract_info(url, download=False)
                             audio_langs = set(fmt.get('language') for fmt in info.get('formats', []) if fmt.get('language') and fmt.get('acodec') != 'none')
@@ -390,6 +434,7 @@ def download_media():
                         ydl_opts['format'] = f"{format_id}+bestaudio/best" if format_id else 'bestvideo+bestaudio/best'
                         ydl_opts['postprocessors'] = [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}]
                     
+                    time.sleep(random.uniform(0.5, 2))
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                         info = ydl.extract_info(url, download=True)
                     logger.info(f"Download success with user cookies for {platform}")
@@ -441,6 +486,7 @@ def download_media():
                                 ydl_opts['format'] = f"{format_id}+bestaudio/best" if format_id else 'bestvideo+bestaudio/best'
                                 ydl_opts['postprocessors'] = [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}]
                             
+                            time.sleep(random.uniform(0.5, 2))
                             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                                 info = ydl.extract_info(url, download=True)
                             logger.info(f"Download success with backend cookies.txt for {platform}")
@@ -486,6 +532,7 @@ def download_media():
                         ydl_opts['format'] = f"{format_id}+bestaudio/best" if format_id else 'bestvideo+bestaudio/best'
                         ydl_opts['postprocessors'] = [{'key': 'FFmpegVideoConvertor', 'preferedformat': 'mp4'}]
                     
+                    time.sleep(random.uniform(0.5, 2))
                     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                         info = ydl.extract_info(url, download=True)
                     logger.info(f"Download success without cookies for {platform}")
@@ -495,12 +542,16 @@ def download_media():
                     logger.warning(f"Download failed without cookies for {platform}: {last_error}")
 
             if not info:
+                with open(status_file, 'w') as f:
+                    f.write(f'error: {last_error or "Unknown error"}')
                 return jsonify({'status': 'error', 'message': f"Download failed after all attempts for {platform}: {last_error or 'Unknown error'}"}), 500
             
             file_extension = info.get('ext', file_extension)
             downloaded_files = [f for f in os.listdir(download_dir) if os.path.isfile(os.path.join(download_dir, f))]
             
             if not downloaded_files:
+                with open(status_file, 'w') as f:
+                    f.write('error: No files downloaded')
                 return jsonify({'status': 'error', 'message': 'No files were downloaded'}), 500
             
             media_file = next((f for f in downloaded_files if f.endswith(f'.{file_extension}')), downloaded_files[0])
@@ -526,6 +577,10 @@ def download_media():
                     os.rename(os.path.join(download_dir, subtitle_file), os.path.join(download_dir, new_subtitle_file))
                     subtitle_file = new_subtitle_file
             
+            # Status Check: Tandai selesai
+            with open(status_file, 'w') as f:
+                f.write('completed')
+            
             response = {
                 'status': 'success',
                 'download_id': download_id,
@@ -537,8 +592,20 @@ def download_media():
             
             return jsonify(response)
     except Exception as e:
+        with open(status_file, 'w') as f:
+            f.write(f'error: {str(e)}')
         logger.error(f"Download error: {str(e)}")
         return jsonify({'status': 'error', 'message': f'Download failed: {str(e)}'}), 500
+
+# Status Check: Endpoint baru buat frontend cek status
+@app.route('/api/status/<download_id>', methods=['GET'])
+def check_status(download_id):
+    status_file = os.path.join(TEMP_DIR, download_id, 'status.txt')
+    if os.path.exists(status_file):
+        with open(status_file, 'r') as f:
+            status = f.read().strip()
+        return jsonify({'status': status})
+    return jsonify({'status': 'error', 'message': 'Download ID not found'}), 404
 
 @app.route('/api/stream', methods=['POST'])
 def stream_media():
@@ -562,11 +629,18 @@ def stream_media():
                 'outtmpl': '-',
                 'nocheckcertificate': True,
                 'geo_bypass': True,
-                'extractor_retries': 5,
-                'socket_timeout': 15,
+                # Retry & Timeout: Naik jadi 10-15 retry sama 20 detik timeout
+                'extractor_retries': 10,
+                'socket_timeout': 20,
                 'user_agent': random.choice(USER_AGENTS),
-                'fragment_retries': 10,
-                'retries': 10,
+                'fragment_retries': 15,
+                'retries': 15,
+                # Anti-Bot: Header tambahan
+                'http_headers': {
+                    'Referer': 'https://www.google.com/',
+                    'Accept': '*/*',
+                    'Accept-Language': 'en-US,en;q=0.5',
+                },
             }
 
             def generate():
@@ -577,7 +651,7 @@ def stream_media():
                     session_cookies = fetch_session_cookies(url, session_data)
                     if session_cookies:
                         ydl_opts = ydl_opts_base.copy()
-                        ydl_opts['http_headers'] = {'Cookie': session_cookies}
+                        ydl_opts['http_headers']['Cookie'] = session_cookies
                         try:
                             if download_type == 'audio' and FFMPEG_AVAILABLE:
                                 ydl_opts['format'] = 'bestaudio/best'
@@ -593,19 +667,21 @@ def stream_media():
                                 content_type = 'video/mp4'
                                 extension = 'mp4'
                             
-                            temp_ydl_opts = {'quiet': True, 'skip_download': True, 'http_headers': {'Cookie': session_cookies}}
+                            temp_ydl_opts = {'quiet': True, 'skip_download': True, 'http_headers': ydl_opts['http_headers']}
                             with yt_dlp.YoutubeDL(temp_ydl_opts) as ydl:
                                 info = ydl.extract_info(url, download=False)
                                 title = info.get('title', 'download').replace('/', '_')
                                 filename = f"{title}.{extension}"
                             
+                            time.sleep(random.uniform(0.5, 2))
                             process = subprocess.Popen(
                                 ['yt-dlp', '-f', ydl_opts['format'], '-o', '-', url, '--http-header', f"Cookie: {session_cookies}"],
                                 stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE
                             )
                             
-                            for chunk in iter(lambda: process.stdout.read(16384), b''):
+                            # Buffer: Naik jadi 32768
+                            for chunk in iter(lambda: process.stdout.read(32768), b''):
                                 yield chunk
                             
                             process.stdout.close()
@@ -618,7 +694,7 @@ def stream_media():
 
                 if user_cookies:
                     ydl_opts = ydl_opts_base.copy()
-                    ydl_opts['http_headers'] = {'Cookie': user_cookies}
+                    ydl_opts['http_headers']['Cookie'] = user_cookies
                     try:
                         if download_type == 'audio' and FFMPEG_AVAILABLE:
                             ydl_opts['format'] = 'bestaudio/best'
@@ -634,19 +710,20 @@ def stream_media():
                             content_type = 'video/mp4'
                             extension = 'mp4'
                         
-                        temp_ydl_opts = {'quiet': True, 'skip_download': True, 'http_headers': {'Cookie': user_cookies}}
+                        temp_ydl_opts = {'quiet': True, 'skip_download': True, 'http_headers': ydl_opts['http_headers']}
                         with yt_dlp.YoutubeDL(temp_ydl_opts) as ydl:
                             info = ydl.extract_info(url, download=False)
                             title = info.get('title', 'download').replace('/', '_')
                             filename = f"{title}.{extension}"
                         
+                        time.sleep(random.uniform(0.5, 2))
                         process = subprocess.Popen(
                             ['yt-dlp', '-f', ydl_opts['format'], '-o', '-', url],
                             stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE
                         )
                         
-                        for chunk in iter(lambda: process.stdout.read(16384), b''):
+                        for chunk in iter(lambda: process.stdout.read(32768), b''):
                             yield chunk
                         
                         process.stdout.close()
@@ -686,13 +763,14 @@ def stream_media():
                                     title = info.get('title', 'download').replace('/', '_')
                                     filename = f"{title}.{extension}"
                                 
+                                time.sleep(random.uniform(0.5, 2))
                                 process = subprocess.Popen(
                                     ['yt-dlp', '-f', ydl_opts['format'], '-o', '-', url],
                                     stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE
                                 )
                                 
-                                for chunk in iter(lambda: process.stdout.read(16384), b''):
+                                for chunk in iter(lambda: process.stdout.read(32768), b''):
                                     yield chunk
                                 
                                 process.stdout.close()
@@ -725,13 +803,14 @@ def stream_media():
                         title = info.get('title', 'download').replace('/', '_')
                         filename = f"{title}.{extension}"
                     
+                    time.sleep(random.uniform(0.5, 2))
                     process = subprocess.Popen(
                         ['yt-dlp', '-f', ydl_opts['format'], '-o', '-', url],
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE
                     )
                     
-                    for chunk in iter(lambda: process.stdout.read(16384), b''):
+                    for chunk in iter(lambda: process.stdout.read(32768), b''):
                         yield chunk
                     
                     process.stdout.close()
@@ -792,9 +871,16 @@ def batch_process():
 @app.route('/api/file/<download_id>/<filename>', methods=['GET'])
 def serve_file(download_id, filename):
     file_path = os.path.join(TEMP_DIR, download_id, filename)
+    status_file = os.path.join(TEMP_DIR, download_id, 'status.txt')
     
-    if not os.path.exists(file_path):
-        abort(404, description="File not found")
+    if not os.path.exists(file_path) or not os.path.exists(status_file):
+        abort(404, description="File or status not found")
+    
+    with open(status_file, 'r') as f:
+        status = f.read().strip()
+    
+    if status != 'completed':
+        return jsonify({'status': 'pending', 'message': 'Download not yet completed'}), 202
     
     try:
         return Response(
